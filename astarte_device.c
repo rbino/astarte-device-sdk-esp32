@@ -39,6 +39,7 @@ struct astarte_device_t
     esp_mqtt_client_handle_t mqtt_client;
 };
 
+static astarte_err_t init_mqtt_cfg(esp_mqtt_client_config_t *cfg, const astarte_device_handle_t device);
 static astarte_err_t retrieve_credentials(struct astarte_pairing_config *pairing_config);
 static astarte_err_t check_device(astarte_device_handle_t device);
 astarte_err_t publish_bson(astarte_device_handle_t device, const char *interface_name, const char *path,
@@ -63,24 +64,75 @@ astarte_device_handle_t astarte_device_init(astarte_device_config_t *cfg)
         return NULL;
     }
 
+    astarte_device_handle_t ret = calloc(1, sizeof(struct astarte_device_t));
+    if (!ret) {
+        ESP_LOGE(TAG, "Out of memory %s: %d", __FILE__, __LINE__);
+        return NULL;
+    }
+    ret->encoded_hwid = strdup(encoded_hwid);
+    if (!ret->encoded_hwid) {
+        ESP_LOGE(TAG, "Out of memory %s: %d", __FILE__, __LINE__);
+        free(ret);
+        return NULL;
+    }
+
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    int res;
+    if ((res = init_mqtt_cfg(&mqtt_cfg, ret)) != ASTARTE_OK) {
+        ESP_LOGE(TAG, "Cannot initialize MQTT config: %d", res);
+        free(ret);
+        return NULL;
+    }
+
+    char *client_cert_cn = calloc(CN_LENGTH, sizeof(char));
+    if (!client_cert_cn) {
+        ESP_LOGE(TAG, "Out of memory %s: %d", __FILE__, __LINE__);
+        free(ret);
+        return NULL;
+    }
+    err = astarte_credentials_get_certificate_common_name(client_cert_cn, CN_LENGTH);
+    if (err != ASTARTE_OK) {
+        ESP_LOGE(TAG, "Error in get_certificate_common_name");
+        free(client_cert_cn);
+        free(ret);
+        return NULL;
+    } else {
+        ESP_LOGI(TAG, "Device topic is: %s", client_cert_cn);
+    }
+
+    esp_mqtt_client_handle_t mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (!mqtt_client) {
+        ESP_LOGE(TAG, "Error in esp_mqtt_client_init");
+        free(client_cert_cn);
+        free(ret);
+        return NULL;
+    }
+
+    ret->mqtt_client = mqtt_client;
+    ret->device_topic = client_cert_cn;
+    ret->device_topic_len = strlen(client_cert_cn);
+    ret->data_event_callback = cfg->data_event_callback;
+
+    return ret;
+}
+
+static astarte_err_t init_mqtt_cfg(esp_mqtt_client_config_t *cfg, const astarte_device_handle_t device) {
     struct astarte_pairing_config pairing_config = {
         .base_url = CONFIG_ASTARTE_PAIRING_BASE_URL,
         .jwt = CONFIG_ASTARTE_PAIRING_JWT,
         .realm = CONFIG_ASTARTE_REALM,
-        .hw_id = encoded_hwid,
+        .hw_id = device->encoded_hwid,
     };
     char credentials_secret[CREDENTIALS_SECRET_LENGTH];
-    err = astarte_pairing_get_credentials_secret(&pairing_config, credentials_secret, CREDENTIALS_SECRET_LENGTH);
+    astarte_err_t err = astarte_pairing_get_credentials_secret(&pairing_config, credentials_secret, CREDENTIALS_SECRET_LENGTH);
     if (err != ASTARTE_OK) {
         ESP_LOGE(TAG, "Error in get_credentials_secret");
-        return NULL;
+        return ASTARTE_ERR;
     } else {
         ESP_LOGI(TAG, "credentials_secret is: %s", credentials_secret);
     }
 
-    astarte_device_handle_t ret = NULL;
     char *client_cert_pem = NULL;
-    char *client_cert_cn = NULL;
     char *broker_url = NULL;
     char *key_pem = NULL;
 
@@ -114,19 +166,6 @@ astarte_device_handle_t astarte_device_init(astarte_device_config_t *cfg)
         ESP_LOGI(TAG, "Certificate is: %s", client_cert_pem);
     }
 
-    client_cert_cn = calloc(CN_LENGTH, sizeof(char));
-    if (!client_cert_cn) {
-        ESP_LOGE(TAG, "Out of memory %s: %d", __FILE__, __LINE__);
-        goto init_failed;
-    }
-    err = astarte_credentials_get_certificate_common_name(client_cert_cn, CN_LENGTH);
-    if (err != ASTARTE_OK) {
-        ESP_LOGE(TAG, "Error in get_certificate_common_name");
-        goto init_failed;
-    } else {
-        ESP_LOGI(TAG, "Device topic is: %s", client_cert_cn);
-    }
-
     broker_url = calloc(URL_LENGTH, sizeof(char));
     if (!broker_url) {
         ESP_LOGE(TAG, "Out of memory %s: %d", __FILE__, __LINE__);
@@ -140,47 +179,20 @@ astarte_device_handle_t astarte_device_init(astarte_device_config_t *cfg)
         ESP_LOGI(TAG, "Broker URL is: %s", broker_url);
     }
 
-    ret = calloc(1, sizeof(struct astarte_device_t));
-    if (!ret) {
-        ESP_LOGE(TAG, "Out of memory %s: %d", __FILE__, __LINE__);
-        goto init_failed;
-    }
+    cfg->uri = broker_url;
+    cfg->client_cert_pem = client_cert_pem;
+    cfg->client_key_pem = key_pem;
+    cfg->event_handle = mqtt_event_handler;
+    cfg->user_context = device;
 
-    const esp_mqtt_client_config_t mqtt_cfg = {
-        .uri = broker_url,
-        .event_handle = mqtt_event_handler,
-        .client_cert_pem = client_cert_pem,
-        .client_key_pem = key_pem,
-        .user_context = ret,
-    };
-    esp_mqtt_client_handle_t mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    if (!mqtt_client) {
-        ESP_LOGE(TAG, "Error in esp_mqtt_client_init");
-        goto init_failed;
-    }
-    ret->mqtt_client = mqtt_client;
-
-    ret->encoded_hwid = strdup(encoded_hwid);
-    if (!ret->encoded_hwid) {
-        ESP_LOGE(TAG, "Out of memory %s: %d", __FILE__, __LINE__);
-        goto init_failed;
-    }
-
-    ret->device_topic = client_cert_cn;
-    ret->device_topic_len = strlen(client_cert_cn);
-    ret->introspection_string = NULL;
-    ret->data_event_callback = cfg->data_event_callback;
-
-    return ret;
+    return ASTARTE_OK;
 
 init_failed:
-    free(ret);
     free(key_pem);
     free(client_cert_pem);
-    free(client_cert_cn);
     free(broker_url);
 
-    return NULL;
+    return ASTARTE_ERR;
 }
 
 void astarte_device_destroy(astarte_device_handle_t device)
