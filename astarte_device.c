@@ -48,6 +48,7 @@ static void setup_subscriptions(astarte_device_handle_t device);
 static void send_introspection(astarte_device_handle_t device);
 static void on_connected(astarte_device_handle_t device, int session_present);
 static void on_incoming(astarte_device_handle_t device, char *topic, int topic_len, char *data, int data_len);
+static void on_certificate_error(astarte_device_handle_t device);
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event);
 
 astarte_device_handle_t astarte_device_init(astarte_device_config_t *cfg)
@@ -560,6 +561,20 @@ static void on_incoming(astarte_device_handle_t device, char *topic, int topic_l
     device->data_event_callback(&event);
 }
 
+static void on_certificate_error(astarte_device_handle_t device)
+{
+    ESP_LOGW(TAG, "Certificate error, requesting a new certificate");
+
+    astarte_credentials_delete_certificate();
+
+    // This will ask the certificate again
+    esp_mqtt_client_config_t mqtt_cfg = {};
+    init_mqtt_cfg(&mqtt_cfg, device);
+
+    esp_mqtt_set_config(device->mqtt_client, &mqtt_cfg);
+    esp_mqtt_client_reconnect(device->mqtt_client);
+}
+
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 {
     astarte_device_handle_t device = (astarte_device_handle_t) event->user_context;
@@ -596,6 +611,9 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 
         case MQTT_EVENT_ERROR:
             ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_ESP_TLS) {
+                on_certificate_error(device);
+            }
             break;
     }
     return ESP_OK;
