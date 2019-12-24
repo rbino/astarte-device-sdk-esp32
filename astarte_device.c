@@ -572,7 +572,6 @@ static void on_certificate_error(astarte_device_handle_t device)
     init_mqtt_cfg(&mqtt_cfg, device);
 
     esp_mqtt_set_config(device->mqtt_client, &mqtt_cfg);
-    esp_mqtt_client_reconnect(device->mqtt_client);
 }
 
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
